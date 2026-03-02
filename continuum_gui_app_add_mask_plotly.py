@@ -2,8 +2,16 @@
 """
 continuum_gui_app.py  (Streamlit + Plotly)
 
-GUI tool:
-- Upload bases NPZ trained on REST-FRAME grid
+AGN Continuum Reconstruction & Normalization Toolkit
+Version 1.3
+
+Author: Vivek M
+Bug reports: vivek.m@iiap.res.in
+
+Features
+--------
+- Default bases auto-loaded from repo: bases/default_bases.npz
+  + Optional override upload of a different bases NPZ.
 - Upload a standard SDSS FITS spectrum (observed frame)
 - Convert to REST-FRAME using redshift z with precedence:
     (a) user input z_user if > 0
@@ -17,7 +25,7 @@ GUI tool:
 - Fit ALL 4 methods, compute metrics on mask-free regions and show a comparison table
 - Highlight best method (lowest wRMSE) and print note below
 - Interactive Plotly plot (zoomable) with 2 panels (flux+cont, normalized), mask shading
-- Download CSV for the selected method with:
+- Download CSV for selected method:
     rest_wavelength, flux, ivar, reconstructed_continuum,
     normalised_flux, normalised_error, mask
 
@@ -27,6 +35,7 @@ Run:
 """
 
 import io
+import os
 import re
 import numpy as np
 import pandas as pd
@@ -40,6 +49,8 @@ try:
     from scipy.optimize import nnls
 except Exception:
     nnls = None
+
+DEFAULT_BASES_PATH = os.path.join("bases", "default_bases.npz")
 
 
 # ----------------------------
@@ -234,13 +245,17 @@ def read_sdss_fits(uploaded_file_bytes):
 
 
 # ----------------------------
-# Bases + scaling helpers
+# Bases loading (clean + cached)
 # ----------------------------
-def load_bases_npz(path_or_bytes):
-    if isinstance(path_or_bytes, (bytes, bytearray)):
-        d = np.load(io.BytesIO(path_or_bytes), allow_pickle=False)
-    else:
-        d = np.load(path_or_bytes, allow_pickle=False)
+@st.cache_resource(show_spinner=False)
+def load_bases_npz_from_path(path: str):
+    d = np.load(path, allow_pickle=False)
+    return {k: d[k] for k in d.files}
+
+
+@st.cache_resource(show_spinner=False)
+def load_bases_npz_from_bytes(b: bytes):
+    d = np.load(io.BytesIO(b), allow_pickle=False)
     return {k: d[k] for k in d.files}
 
 
@@ -388,8 +403,8 @@ def compute_metrics(flux_s, cont, ivar_s, trusted_fit, mask_total):
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="BAL Continuum Normalizer (PCA/ICA/EMPCA/NMF)", layout="wide")
-#st.title(" AGN Continuum Reconstruction & Normalization Toolkit ")
+st.set_page_config(page_title="AGNContinuumNorm v1.3", layout="wide")
+
 st.markdown("### AGN Continuum Reconstruction & Normalization Toolkit")
 st.caption("Version 1.3")
 
@@ -405,17 +420,18 @@ with st.expander("About this app"):
         - EMPCA
         - NMF
 
-        Includes adaptive masking and user-defined wavelength masking.
-        Current version only can handle SDSS spectra.
+        Includes adaptive masking and user-defined wavelength masking.  
+        Current version can handle SDSS spectra.
 
-        📩 For bug reports or feature requests:  
-        **vivek.m@iiap.res.in**
+        📩 For bug reports or feature requests: **vivek.m@iiap.res.in**
         """
     )
 st.markdown("---")
+
 with st.sidebar:
     st.header("Inputs")
-    bases_file = st.file_uploader("Upload bases NPZ (REST-FRAME grid)", type=["npz"])
+
+    bases_override = st.file_uploader("Optional: Override basis NPZ", type=["npz"])
     spec_file = st.file_uploader("Upload SDSS FITS spectrum", type=["fits", "fit", "fz"])
 
     method = st.selectbox("Methodology (for plot & download)", ["PCA", "ICA", "EMPCA", "NMF"], index=2)
@@ -470,13 +486,30 @@ with st.sidebar:
 
     run_btn = st.button("Reconstruct + Plot", type="primary")
 
-if bases_file is None or spec_file is None:
-    st.info("Upload a **bases NPZ** and a **SDSS FITS** spectrum to begin.")
+# ---- Require spectrum ----
+if spec_file is None:
+    st.info("Upload an SDSS FITS spectrum to begin.")
     st.stop()
 
-bases = load_bases_npz(bases_file.getvalue())
+# ---- Load bases: default from repo, optional override ----
+try:
+    bases = load_bases_npz_from_path(DEFAULT_BASES_PATH)
+    bases_source = f"default: {DEFAULT_BASES_PATH}"
+except Exception as e:
+    st.error(f"Failed to load default bases from {DEFAULT_BASES_PATH}: {e}")
+    st.stop()
 
-# Load spectrum + z from HDU2 if present
+if bases_override is not None:
+    try:
+        bases = load_bases_npz_from_bytes(bases_override.getvalue())
+        bases_source = "override upload"
+    except Exception as e:
+        st.error(f"Failed to load uploaded bases NPZ: {e}")
+        st.stop()
+
+st.sidebar.info(f"Using bases: **{bases_source}**")
+
+# ---- Load spectrum + z from HDU2 if present ----
 try:
     wave_obs, flux_obs, ivar_obs, hdr0, z_from_hdu2, meta = read_sdss_fits(spec_file.getvalue())
 except Exception as e:
@@ -629,7 +662,7 @@ fig.add_trace(
         y=flux_s,
         mode="lines",
         name="Flux (scaled)",
-        line=dict(width=1,color='blue'),
+        line=dict(width=1, color="blue"),
         opacity=0.6,
         hovertemplate="λ=%{x:.2f} Å<br>flux=%{y:.4g}<extra></extra>"
     ),
@@ -642,7 +675,7 @@ fig.add_trace(
         y=cont,
         mode="lines",
         name=f"Continuum ({method})",
-        line=dict(width=3,color='red'),
+        line=dict(width=3, color="red"),
         hovertemplate="λ=%{x:.2f} Å<br>cont=%{y:.4g}<extra></extra>"
     ),
     row=1, col=1
@@ -654,7 +687,7 @@ fig.add_trace(
         y=norm_flux,
         mode="lines",
         name="Normalized flux",
-        line=dict(width=1,color='blue'),
+        line=dict(width=1, color="blue"),
         opacity=0.6,
         hovertemplate="λ=%{x:.2f} Å<br>norm=%{y:.4g}<extra></extra>"
     ),
@@ -666,7 +699,7 @@ fig.add_trace(
         x=[float(wave_rest.min()), float(wave_rest.max())],
         y=[1.0, 1.0],
         mode="lines",
-        line=dict(dash="dash",width=2,color='red'),
+        line=dict(dash="dash", width=2, color="red"),
         showlegend=False,
         hoverinfo="skip"
     ),
@@ -722,6 +755,7 @@ st.download_button(
     file_name=out_name,
     mime="text/csv",
 )
+
 # ----------------------------
 # Metrics table + highlight best
 # ----------------------------
@@ -736,21 +770,13 @@ for mth in all_methods:
         "med|z|": met["med_abs_z"],
     })
 df_metrics = pd.DataFrame(rows)
+
 st.markdown("---")
 st.subheader("Fit-quality metrics (computed on mask-free regions)")
 
 best_idx = df_metrics["wRMSE"].astype(float).idxmin()
 best_method = df_metrics.loc[best_idx, "Method"]
 best_wrmse = float(df_metrics.loc[best_idx, "wRMSE"])
-
-st.markdown(
-    f"""
-**Best fit (highlighted above): {best_method}**  
-Lowest weighted RMSE = **{best_wrmse:.4f}**  
-
-Selection criterion: minimum **wRMSE** (weighted root-mean-square residual in flux units).
-"""
-)
 
 def highlight_best(row):
     if row.name == best_idx:
@@ -764,6 +790,16 @@ styled_df = df_metrics.style.apply(highlight_best, axis=1).format({
 })
 
 st.dataframe(styled_df, use_container_width=True)
+
+st.markdown(
+    f"""
+**Best fit (highlighted above): {best_method}**  
+Lowest weighted RMSE = **{best_wrmse:.4f}**  
+
+Selection criterion: minimum **wRMSE** (weighted root-mean-square residual in flux units).
+"""
+)
+
 st.markdown("---")
 st.markdown(
     r"""
@@ -777,6 +813,3 @@ st.markdown(
   $$z=(f-c)\sqrt{\mathrm{ivar}},\qquad \mathrm{med}|z|=\mathrm{median}(|z|).$$
 """
 )
-
-
-
