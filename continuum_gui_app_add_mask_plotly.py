@@ -22,6 +22,8 @@ Features
 - Optionally median-scale BEFORE fitting
 - Choose method for plotting & download: PCA / ICA / EMPCA / NMF
 - Auto one-sided absorption masking + USER-DEFINED wavelength masks (any number)
+- NEW: Manual mask frame selectable (Rest-frame or Observed-frame). Observed-frame
+       intervals are converted to rest frame by dividing by (1+z).
 - Fit ALL 4 methods, compute metrics on mask-free regions and show a comparison table
 - Highlight best method (lowest wRMSE) and print note below
 - Interactive Plotly plot (zoomable) with 2 panels (flux+cont, normalized), mask shading
@@ -103,7 +105,7 @@ def interp_ivar_to_grid(w_in, iv_in, w_out):
 
 def intervals_to_mask(wave, intervals):
     """
-    intervals: list of (lo, hi) in same units as wave (REST Å)
+    intervals: list of (lo, hi) in same units as wave (Å)
     returns boolean mask True inside any interval
     """
     m = np.zeros_like(wave, dtype=bool)
@@ -388,7 +390,7 @@ def compute_metrics(flux_s, cont, ivar_s, trusted_fit, mask_total):
     w = ivar_s[good]
 
     chi2 = float(np.sum(r * r * w))
-    dof = max(n - 1, 1)  # stable proxy (optionally replace with n-K if you store K)
+    dof = max(n - 1, 1)
     chi2_nu = chi2 / dof
 
     wsum = float(np.sum(w))
@@ -450,14 +452,20 @@ with st.sidebar:
     min_run = st.slider("min_run (pixels)", 1, 20, 3, 1)
     grow = st.slider("grow (pixels)", 0, 15, 1, 1)
 
-    st.subheader("User-defined masks (rest-frame Å)")
+    st.subheader("User-defined masks")
+    mask_frame = st.radio(
+        "Manual mask wavelength frame",
+        ["Rest-frame (Å)", "Observed-frame (Å)"],
+        index=0
+    )
+
     if "user_masks" not in st.session_state:
-        st.session_state.user_masks = []  # list of (lo, hi)
+        st.session_state.user_masks = []  # list of (lo, hi) in selected frame
 
     with st.expander("Add / manage masks", expanded=False):
         colA, colB = st.columns(2)
-        lo = colA.number_input("Mask λ_low (Å)", value=0.0, step=1.0, format="%.2f")
-        hi = colB.number_input("Mask λ_high (Å)", value=0.0, step=1.0, format="%.2f")
+        lo = colA.number_input("Mask λ_low", value=0.0, step=1.0, format="%.2f")
+        hi = colB.number_input("Mask λ_high", value=0.0, step=1.0, format="%.2f")
 
         c1, c2, c3 = st.columns(3)
         if c1.button("Add mask"):
@@ -475,7 +483,7 @@ with st.sidebar:
         if len(st.session_state.user_masks) == 0:
             st.caption("No user masks yet.")
         else:
-            st.write("Current masks:")
+            st.write("Current masks (in the selected frame):")
             st.table(pd.DataFrame(st.session_state.user_masks, columns=["λ_low", "λ_high"]))
 
     st.subheader("Flux scale option")
@@ -483,6 +491,8 @@ with st.sidebar:
         "Apply strict f_lambda rest-frame scaling: f_rest=(1+z)f_obs, ivar_rest=ivar_obs/(1+z)^2",
         value=False
     )
+
+    show_masked_as_gaps = st.checkbox("Hide masked pixels in plot (set to NaN)", value=False)
 
     run_btn = st.button("Reconstruct + Plot", type="primary")
 
@@ -569,8 +579,26 @@ valid_g = np.isfinite(flux_g) & (ivar_g > 0)
 flux_g = np.where(np.isfinite(flux_g), flux_g, 0.0)
 wave_rest = wave_train  # final axis for fit/plot/output
 
-# User-defined masks are in REST-frame wavelength coordinates (wave_rest)
-user_mask = intervals_to_mask(wave_rest, st.session_state.user_masks)
+# ---- Build USER mask on rest grid ----
+if mask_frame.startswith("Rest"):
+    user_mask = intervals_to_mask(wave_rest, st.session_state.user_masks)
+    user_mask_note = "manual masks applied in REST frame"
+else:
+    # user provided observed-frame intervals -> convert to rest
+    intervals_rest = []
+    for lo, hi in st.session_state.user_masks:
+        if lo is None or hi is None:
+            continue
+        lo2, hi2 = float(min(lo, hi)), float(max(lo, hi))
+        if (z is not None) and (z >= 0):
+            lo2 /= (1.0 + z)
+            hi2 /= (1.0 + z)
+        intervals_rest.append((lo2, hi2))
+    user_mask = intervals_to_mask(wave_rest, intervals_rest)
+    user_mask_note = "manual masks provided in OBS frame, converted to REST"
+
+# Small diagnostic so you can *verify* it is doing something
+st.caption(f"Manual mask diagnostic: masked pixels = {int(user_mask.sum())}/{user_mask.size} ({user_mask_note})")
 
 # Metadata for filename
 ra = meta.get("ra", None)
@@ -616,7 +644,7 @@ for mth in all_methods:
     else:
         cont0 = cont0_feat
 
-    # auto mask from one-sided residuals
+    # auto mask from one-sided residuals (only evaluated on trusted_fit region)
     mask_raw = np.zeros_like(flux_s, dtype=bool)
     mask_raw[trusted_fit] = (flux_s[trusted_fit] < (cont0[trusted_fit] - float(k) * sigma[trusted_fit]))
     mask_auto = contiguous_mask(mask_raw, min_run=min_run, grow=grow)
@@ -645,6 +673,13 @@ norm_flux = flux_s / cont_safe
 norm_err = np.zeros_like(norm_flux, dtype=np.float64)
 norm_err[good_ivar] = (1.0 / np.sqrt(ivar_s[good_ivar])) / cont_safe[good_ivar]
 
+# Optional: visually hide masked pixels
+plot_flux = flux_s.copy()
+plot_norm = norm_flux.copy()
+if show_masked_as_gaps:
+    plot_flux[mask_total] = np.nan
+    plot_norm[mask_total] = np.nan
+
 # ----------------------------
 # Interactive Plotly plot (zoomable)
 # ----------------------------
@@ -659,7 +694,7 @@ fig = make_subplots(
 fig.add_trace(
     go.Scatter(
         x=wave_rest,
-        y=flux_s,
+        y=plot_flux,
         mode="lines",
         name="Flux (scaled)",
         line=dict(width=1, color="blue"),
@@ -684,7 +719,7 @@ fig.add_trace(
 fig.add_trace(
     go.Scatter(
         x=wave_rest,
-        y=norm_flux,
+        y=plot_norm,
         mode="lines",
         name="Normalized flux",
         line=dict(width=1, color="blue"),
